@@ -1,0 +1,1 @@
+ /Users/bhoomishukla/StudioProjects/lgtask3/.dart_tool/flutter_build/5e6cabfc88bc5126f2d35b4910f7efed/native_assets.yaml: 
