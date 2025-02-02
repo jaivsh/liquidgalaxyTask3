@@ -1,6 +1,7 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:google_mlkit_commons/google_mlkit_commons.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'camera_view.dart';
 import 'gallery_view.dart';
@@ -46,20 +47,71 @@ class _DetectorViewState extends State<DetectorView> {
 
   @override
   Widget build(BuildContext context) {
-    return _mode == DetectorViewMode.liveFeed
-        ? CameraView(
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: _mode == DetectorViewMode.liveFeed
+          ? Stack(
+        children: [
+          CameraView(
             customPaint: widget.customPaint,
             onImage: widget.onImage,
             onCameraFeedReady: widget.onCameraFeedReady,
             onDetectorViewModeChanged: _onDetectorViewModeChanged,
             initialCameraLensDirection: widget.initialCameraLensDirection,
             onCameraLensDirectionChanged: widget.onCameraLensDirectionChanged,
-          )
-        : GalleryView(
-            title: widget.title,
-            text: widget.text,
-            onImage: widget.onImage,
-            onDetectorViewModeChanged: _onDetectorViewModeChanged);
+          ),
+          if (widget.text != null)
+            Positioned(
+              bottom: 30,
+              left: 0,
+              right: 0,
+              child: Container(
+                padding: EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  widget.text!,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+          Positioned(
+            top: 40,
+            left: 0,
+            right: 0,
+            child: Container(
+              padding: EdgeInsets.symmetric(horizontal: 24, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black54,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                '',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ],
+      )
+          : GalleryView(
+        title: widget.title,
+        text: widget.text,
+        onImage: widget.onImage,
+        onDetectorViewModeChanged: _onDetectorViewModeChanged,
+      ),
+    );
   }
 
   void _onDetectorViewModeChanged() {
