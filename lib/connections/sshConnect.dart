@@ -1,11 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-
 import 'package:dartssh2/dartssh2.dart';
+import 'package:flutter/cupertino.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-
 import '../KMLHandle/KML.dart';
 import '../providers/dataprov.dart';
 import '../providers/settingsProvider.dart';
@@ -14,37 +13,59 @@ import '../utils/helper.dart';
 class SSH {
   final encoder = const Utf8Encoder();
   final WidgetRef ref;
+  static const int maxRetries = 3;
+  static const Duration retryDelay = Duration(seconds: 2);
+  static const Duration connectionTimeout = Duration(seconds: 5);
 
   SSH({required this.ref});
 
   Future<bool> connect() async {
-    SSHSocket socket;
-    try {
-      socket = await SSHSocket.connect(
-          ref.read(ipProvider), ref.read(portProvider),
-          timeout: const Duration(seconds: 5));
-    } catch (e) {
-      ref.read(isConnectedToLGProvider.notifier).state = false;
-      print(e);
-      return false;
+    int retryCount = 0;
+    while (retryCount < maxRetries) {
+      try {
+        final socket = await SSHSocket.connect(
+          ref.read(ipProvider),
+          ref.read(portProvider),
+          timeout: connectionTimeout,
+        ).timeout(connectionTimeout);
+
+        ref.read(sshClient.notifier).state = SSHClient(
+          socket,
+          username: ref.read(usernameProvider)!,
+          onPasswordRequest: () => ref.read(passwordProvider)!,
+        );
+
+        ref.read(isConnectedToLGProvider.notifier).state = true;
+        return true;
+      } catch (e) {
+        retryCount++;
+        if (retryCount == maxRetries) {
+          ref.read(isConnectedToLGProvider.notifier).state = false;
+          ref.read(errorMessageProvider.notifier).state =
+          'Failed to connect after $maxRetries attempts: $e';
+          return false;
+        }
+        await Future.delayed(retryDelay);
+      }
     }
-
-    ref.read(sshClient.notifier).state = SSHClient(
-      socket,
-      username: ref.read(usernameProvider)!,
-      onPasswordRequest: () => ref.read(passwordProvider)!,
-    );
-
-    ref.read(isConnectedToLGProvider.notifier).state = true;
-    return true;
+    return false;
   }
 
-  disconnect() async {
-    ref.read(sshClient)?.close();
-    ref.read(isConnectedToLGProvider.notifier).state = false;
+  Future<void> disconnect() async {
+    try {
+      final client = ref.read(sshClient);
+      if (client != null) {
+        client.close();  // Since close() returns void, we don't await it
+      }
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error during disconnect: $e';
+    } finally {
+      ref.read(isConnectedToLGProvider.notifier).state = false;
+      ref.read(sshClient.notifier).state = null;
+    }
   }
 
-  Future<String> renderInSlave(context, int slaveNo, String kml) async {
+  Future<String> renderInSlave(BuildContext context, int slaveNo, String kml) async {
     String blank = '''<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2" xmlns:kml="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom">
     <Document id ="logo">
@@ -62,200 +83,220 @@ class SSH {
              </Folder>
     </Document>
 </kml>''';
-    int rigs = 3;
-    rigs = ((3/2).floor() + 1);
+
+    int rigs = ((ref.read(rigsProvider) / 2).floor() + 1);
     try {
-      await ref
-          .read(sshClient)
-          ?.run("echo '$blank' > /var/www/html/kml/slave_$rigs.kml");
-      print('abcd');
+      await _executeCommand('echo \'$blank\' > /var/www/html/kml/slave_$rigs.kml');
       return kml;
     } catch (error) {
-      print('abc');
+      await connectionRetry(context);
       return blank;
     }
   }
 
-  cleanSlaves() async {
+  Future<void> cleanSlaves() async {
     try {
       for (var i = 2; i <= ref.read(rigsProvider); i++) {
-        await ref
-            .read(sshClient)
-            ?.run("echo '' > /var/www/html/kml/slave_$i.kml");
+        await _executeCommand('echo \'\' > /var/www/html/kml/slave_$i.kml');
       }
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error cleaning slaves: $e';
     }
   }
 
-  cleanKML() async {
+  Future<void> cleanKML() async {
     try {
       await stopOrbit();
-      await ref.read(sshClient)!.run('echo "" > /tmp/query.txt');
-      await ref.read(sshClient)!.run("echo '' > /var/www/html/kmls.txt");
+      await _executeCommand('echo "" > /tmp/query.txt');
+      await _executeCommand("echo '' > /var/www/html/kmls.txt");
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error cleaning KML: $e';
     }
   }
 
-  setRefresh() async {
+  Future<void> setRefresh() async {
     try {
       for (var i = 2; i <= ref.read(rigsProvider); i++) {
-        String search = '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href>';
-        String replace =
-            '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href><refreshMode>onInterval<\\/refreshMode><refreshInterval>2<\\/refreshInterval>';
+        final searchPattern = '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href>';
+        final replacePattern =
+            '$searchPattern<refreshMode>onInterval<\\/refreshMode><refreshInterval>2<\\/refreshInterval>';
 
-        await ref.read(sshClient)?.run(
-            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i \'echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$replace/$search/" ~/earth/kml/slave/myplaces.kml\'');
-        await ref.read(sshClient)?.run(
-            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i \'echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$search/$replace/" ~/earth/kml/slave/myplaces.kml\'');
+        await _executeCommand('''
+          sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i '
+            echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$replacePattern/$searchPattern/" ~/earth/kml/slave/myplaces.kml
+            echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$searchPattern/$replacePattern/" ~/earth/kml/slave/myplaces.kml'
+        ''');
       }
-      print("DONE");
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error setting refresh: $e';
     }
   }
 
-  resetRefresh() async {
+  Future<void> resetRefresh() async {
     try {
       for (var i = 2; i <= ref.read(rigsProvider); i++) {
-        String search =
+        final searchPattern =
             '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href><refreshMode>onInterval<\\/refreshMode><refreshInterval>2<\\/refreshInterval>';
-        String replace = '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href>';
+        final replacePattern = '<href>##LG_PHPIFACE##kml\\/slave_$i.kml<\\/href>';
 
-        await ref.read(sshClient)?.run(
-            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i \'echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$search/$replace/" ~/earth/kml/slave/myplaces.kml\'');
+        await _executeCommand('''
+          sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i '
+            echo ${ref.read(passwordProvider)} | sudo -S sed -i "s/$searchPattern/$replacePattern/" ~/earth/kml/slave/myplaces.kml'
+        ''');
       }
-      print("DONE");
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error resetting refresh: $e';
     }
   }
 
-  relaunchLG() async {
+  Future<void> relaunchLG() async {
     try {
       for (var i = 1; i <= ref.read(rigsProvider); i++) {
-        String cmd = """RELAUNCH_CMD="\\
-          if [ -f /etc/init/lxdm.conf ]; then
-            export SERVICE=lxdm
-          elif [ -f /etc/init/lightdm.conf ]; then
-            export SERVICE=lightdm
-          else
-            exit 1
-          fi
-          if  [[ \\\$(service \\\$SERVICE status) =~ 'stop' ]]; then
-            echo ${ref.read(passwordProvider)} | sudo -S service \\\${SERVICE} start
-          else
-            echo ${ref.read(passwordProvider)} | sudo -S service \\\${SERVICE} restart
-          fi
-          " && sshpass -p ${ref.read(passwordProvider)} ssh -x -t lg@lg$i "\$RELAUNCH_CMD\"""";
-        await ref.read(sshClient)?.run(
-            '"/home/${ref.read(usernameProvider)}/bin/lg-relaunch" > /home/${ref.read(usernameProvider)}/log.txt');
-        await ref.read(sshClient)?.run(cmd);
+        final cmd = '''
+          RELAUNCH_CMD="\\
+            if [ -f /etc/init/lxdm.conf ]; then
+              export SERVICE=lxdm
+            elif [ -f /etc/init/lightdm.conf ]; then
+              export SERVICE=lightdm
+            else
+              exit 1
+            fi
+            if  [[ \\\$(service \\\$SERVICE status) =~ 'stop' ]]; then
+              echo ${ref.read(passwordProvider)} | sudo -S service \\\${SERVICE} start
+            else
+              echo ${ref.read(passwordProvider)} | sudo -S service \\\${SERVICE} restart
+            fi
+            " && sshpass -p ${ref.read(passwordProvider)} ssh -x -t lg@lg$i "\$RELAUNCH_CMD"
+        ''';
+
+        await _executeCommand(cmd);
       }
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error relaunching LG: $e';
     }
   }
 
-  rebootLG() async {
+  Future<void> rebootLG() async {
     try {
       for (var i = 1; i <= ref.read(rigsProvider); i++) {
-        await ref.read(sshClient)?.run(
-            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i "echo ${ref.read(passwordProvider)} | sudo -S reboot');
+        await _executeCommand(
+            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i "echo ${ref.read(passwordProvider)} | sudo -S reboot"'
+        );
       }
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error rebooting LG: $e';
     }
   }
 
-  shutdownLG() async {
+  Future<void> shutdownLG() async {
     try {
       for (var i = 1; i <= ref.read(rigsProvider); i++) {
-        await ref.read(sshClient)?.run(
-            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i "echo ${ref.read(passwordProvider)} | sudo -S poweroff"');
+        await _executeCommand(
+            'sshpass -p ${ref.read(passwordProvider)} ssh -t lg$i "echo ${ref.read(passwordProvider)} | sudo -S poweroff"'
+        );
       }
     } catch (e) {
-      print(e);
+      ref.read(errorMessageProvider.notifier).state = 'Error shutting down LG: $e';
     }
   }
 
-  flyTo(double latitude, double longitude, double zoom, double tilt,
+  Future<void> flyTo(double latitude, double longitude, double zoom, double tilt,
       double bearing) async {
-    ref.read(lastGMapPositionProvider.notifier).state = CameraPosition(
-      target: LatLng(latitude, longitude),
-      zoom: zoom,
-      tilt: tilt,
-      bearing: bearing,
-    );
-    await ref.read(sshClient)?.run(
-        'echo "flytoview=${KMLMakers.lookAtLinear(latitude, longitude, zoom, tilt, bearing)}" > /tmp/query.txt');
+    try {
+      // Update last position
+      ref.read(lastGMapPositionProvider.notifier).state = CameraPosition(
+        target: LatLng(latitude, longitude),
+        zoom: zoom,
+        tilt: tilt,
+        bearing: bearing,
+      );
+
+      // Execute fly command
+      await _executeCommand(
+          'echo "flytoview=${KMLMakers.lookAtLinear(latitude, longitude, zoom, tilt, bearing)}" > /tmp/query.txt'
+      );
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error during flyTo: $e';
+      throw e;  // Re-throw to handle in the calling function
+    }
   }
 
-  kmlFileUpload(File inputFile, String kmlName) async {
+  Future<void> kmlFileUpload(File inputFile, String kmlName) async {
     bool uploading = true;
-    await ref.read(sshClient)?.sftp();
-    final sftp = await ref.read(sshClient)?.sftp();
-    final file = await sftp?.open('/var/www/html/$kmlName.kml',
-        mode: SftpFileOpenMode.create |
-            SftpFileOpenMode.truncate |
-            SftpFileOpenMode.write);
-    var fileSize = await inputFile.length();
-    file?.write(inputFile.openRead().cast(), onProgress: (progress) {
-      ref.read(loadingPercentageProvider.notifier).state = progress / fileSize;
-      if (fileSize == progress) {
-        uploading = false;
-      }
-    });
-    if (file == null) {
-      return;
-    }
-    await waitWhile(() => uploading);
-    ref.read(loadingPercentageProvider.notifier).state = null;
-  }
-
-  runKml(String kmlName) async {
-    await ref
-        .read(sshClient)
-        ?.run("echo '\nhttp://lg1:81/$kmlName.kml' > /var/www/html/kmls.txt");
-  }
-
-  startOrbit() async {
-    await ref.read(sshClient)?.run('echo "playtour=Orbit" > /tmp/query.txt');
-  }
-
-  stopOrbit() async {
-    await ref.read(sshClient)?.run('echo "exittour=true" > /tmp/query.txt');
-  }
-
-  moveNorth(double latitude, double longitude, double zoom, double tilt,
-      double bearing) async {
-    ref.read(lastGMapPositionProvider.notifier).state = CameraPosition(
-      target: LatLng(latitude, longitude),
-      zoom: zoom,
-      tilt: tilt,
-      bearing: bearing,
-    );
-    await ref.read(sshClient)?.run(
-        'echo "flytoview=${KMLMakers.lookAtLinear(latitude, longitude, zoom, tilt, bearing)}" > /tmp/query.txt');
-  }
-
-  connectionRetry(context, {int i = 0}) async {
-    ref.read(sshClient)?.close();
-    SSHSocket socket;
     try {
-      socket = await SSHSocket.connect(
-          ref.read(ipProvider), ref.read(portProvider),
-          timeout: const Duration(seconds: 5));
-    } catch (error) {
-      ref.read(isConnectedToLGProvider.notifier).state = false;
-      return false;
+      final sftp = await ref.read(sshClient)?.sftp();
+      if (sftp == null) throw Exception('Failed to initialize SFTP');
+
+      final file = await sftp.open(
+          '/var/www/html/$kmlName.kml',
+          mode: SftpFileOpenMode.create |
+          SftpFileOpenMode.truncate |
+          SftpFileOpenMode.write
+      );
+
+      if (file == null) throw Exception('Failed to create remote file');
+
+      var fileSize = await inputFile.length();
+      await file.write(
+          inputFile.openRead().cast(),
+          onProgress: (progress) {
+            ref.read(loadingPercentageProvider.notifier).state = progress / fileSize;
+            if (fileSize == progress) {
+              uploading = false;
+            }
+          }
+      );
+
+      await waitWhile(() => uploading);
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error uploading KML: $e';
+      throw e;
+    } finally {
+      ref.read(loadingPercentageProvider.notifier).state = null;
+    }
+  }
+
+  Future<void> runKml(String kmlName) async {
+    try {
+      await _executeCommand(
+          "echo '\nhttp://lg1:81/$kmlName.kml' > /var/www/html/kmls.txt"
+      );
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error running KML: $e';
+    }
+  }
+
+  Future<void> startOrbit() async {
+    try {
+      await _executeCommand('echo "playtour=Orbit" > /tmp/query.txt');
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error starting orbit: $e';
+    }
+  }
+
+  Future<void> stopOrbit() async {
+    try {
+      await _executeCommand('echo "exittour=true" > /tmp/query.txt');
+    } catch (e) {
+      ref.read(errorMessageProvider.notifier).state = 'Error stopping orbit: $e';
+    }
+  }
+
+  Future<bool> connectionRetry(BuildContext context) async {
+    ref.read(sshClient)?.close();
+    return await connect();
+  }
+
+  Future<void> _executeCommand(String command) async {
+    final client = ref.read(sshClient);
+    if (client == null) {
+      throw Exception('SSH client not initialized');
     }
 
-    ref.read(sshClient.notifier).state = SSHClient(
-      socket,
-      username: ref.read(usernameProvider)!,
-      onPasswordRequest: () => ref.read(passwordProvider)!,
-    );
+    try {
+      await client.run(command);
+    } catch (e) {
+      throw Exception('Command execution failed: $e');
+    }
   }
 }
